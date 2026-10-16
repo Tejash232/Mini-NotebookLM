@@ -158,6 +158,15 @@ def is_production() -> bool:
     return _setting("APP_ENV").lower() == "production"
 
 
+def cookie_samesite() -> str:
+    value = _setting("AUTH_COOKIE_SAMESITE", "strict").lower()
+    if value not in {"strict", "lax", "none"}:
+        raise HTTPException(status_code=503, detail="Cookie security configuration is invalid.")
+    if value == "none" and not is_production():
+        raise HTTPException(status_code=503, detail="SameSite=None cookies require production HTTPS.")
+    return value
+
+
 if __name__ == "__main__":
     from getpass import getpass
 

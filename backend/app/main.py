@@ -8,7 +8,7 @@ from uuid import uuid4
 from pathlib import Path
 from fastapi import Depends, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response as RawResponse
 from app.generation import generate_answer
 from app import database
 from app.auth import (
@@ -16,6 +16,7 @@ from app.auth import (
     SESSION_COOKIE,
     SESSION_TTL_SECONDS,
     allowed_origins,
+    cookie_samesite,
     clear_login_failures,
     create_csrf_token,
     is_production,
@@ -36,9 +37,10 @@ from app.auth import (
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
-from app.ingest import extract_pdf_pages
+from app.ingest import extract_pdf_pages, extract_pdf_pages_from_bytes
 from app.chunking import split_pages_into_chunks
 from app.vector_store import (
+    backend as vector_backend,
     store_chunks,
     search_chunks,
     list_documents,
@@ -58,6 +60,9 @@ async def lifespan(_app):
     # Verify the explicitly configured database is reachable on startup.
     # Production schema changes must already have been applied by Alembic.
     database.initialize_database()
+    if vector_backend() == "pgvector":
+        from app.supabase_storage import validate_configuration
+        validate_configuration()
     yield
 
 
@@ -84,13 +89,14 @@ class RegisterRequest(LoginRequest):
 
 
 def _set_cookie(response: Response, name: str, value: str, *, http_only: bool, max_age: int) -> None:
+    same_site = cookie_samesite()
     response.set_cookie(
         key=name,
         value=value,
         max_age=max_age,
         httponly=http_only,
-        secure=is_production(),
-        samesite="strict",
+        secure=is_production() or same_site == "none",
+        samesite=same_site,
         path="/",
     )
 
@@ -157,8 +163,10 @@ def register(request: Request, response: Response, credentials: RegisterRequest)
 def logout(request: Request, response: Response, user: dict = Depends(require_csrf)):
     del user
     revoke_session(request.cookies.get(SESSION_COOKIE))
-    response.delete_cookie(SESSION_COOKIE, path="/", secure=is_production(), httponly=True, samesite="strict")
-    response.delete_cookie(CSRF_COOKIE, path="/", secure=is_production(), httponly=True, samesite="strict")
+    same_site = cookie_samesite()
+    secure_cookie = is_production() or same_site == "none"
+    response.delete_cookie(SESSION_COOKIE, path="/", secure=secure_cookie, httponly=True, samesite=same_site)
+    response.delete_cookie(CSRF_COOKIE, path="/", secure=secure_cookie, httponly=True, samesite=same_site)
     return {"authenticated": False}
 class SearchRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
@@ -213,61 +221,54 @@ async def upload_pdf(file: UploadFile = File(...), user: dict = Depends(require_
             detail="Please upload a PDF file.",
         )
 
-    upload_directory = database.data_dir() / "uploads" / user["id"]
-    upload_directory.mkdir(parents=True, exist_ok=True)
     document_id = uuid4().hex
-    persistent_path = upload_directory / f"{document_id}.pdf"
-
-    total_bytes = 0
+    hosted = vector_backend() == "pgvector"
+    persistent_path = None
+    storage_key = None
+    document_created = False
+    storage_uploaded = False
     try:
-        with persistent_path.open("wb") as target:
-            while block := await file.read(1024 * 1024):
-                total_bytes += len(block)
-                if total_bytes > MAX_UPLOAD_BYTES:
-                    raise HTTPException(status_code=413, detail="PDF files must be 30 MB or smaller.")
-                target.write(block)
-    except Exception:
-        persistent_path.unlink(missing_ok=True)
-        raise
-    finally:
-        await file.close()
+        pdf_bytes = await file.read(MAX_UPLOAD_BYTES + 1)
+        if len(pdf_bytes) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="PDF files must be 30 MB or smaller.")
+        if not pdf_bytes.startswith(b"%PDF-"):
+            raise HTTPException(status_code=400, detail="The uploaded file is not a valid PDF.")
 
-    with persistent_path.open("rb") as source_file:
-        is_pdf = source_file.read(5) == b"%PDF-"
-    if not is_pdf:
-        persistent_path.unlink(missing_ok=True)
-        raise HTTPException(
-            status_code=400,
-            detail="The uploaded file is not a valid PDF.",
-        )
+        if database.get_document(user["id"], raw_filename):
+            raise HTTPException(status_code=409, detail="A document with this filename already exists in your workspace.")
 
-    if database.get_document(user["id"], raw_filename):
-        persistent_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=409, detail="A document with this filename already exists in your workspace.")
-
-    try:
-        pages = extract_pdf_pages(str(persistent_path))
+        if hosted:
+            pages = extract_pdf_pages_from_bytes(pdf_bytes)
+            storage_key = f"{user['id']}/{document_id}.pdf"
+            stored_path = None
+        else:
+            upload_directory = database.data_dir() / "uploads" / user["id"]
+            upload_directory.mkdir(parents=True, exist_ok=True)
+            persistent_path = upload_directory / f"{document_id}.pdf"
+            persistent_path.write_bytes(pdf_bytes)
+            pages = extract_pdf_pages(str(persistent_path))
+            stored_path = str(persistent_path)
 
         if not pages:
-            raise HTTPException(
-                status_code=422,
-                detail="No extractable text found. The PDF may be scanned.",
-            )
+            raise HTTPException(status_code=422, detail="No extractable text found. The PDF may be scanned.")
 
-        chunks = split_pages_into_chunks(
-            pages=pages,
-            filename=raw_filename,
-        )
+        chunks = split_pages_into_chunks(pages=pages, filename=raw_filename)
         for chunk in chunks:
             chunk["metadata"]["owner_id"] = user["id"]
             chunk["metadata"]["document_id"] = document_id
 
-        stored_count = store_chunks(chunks)
-        if not database.create_document(user["id"], raw_filename, str(persistent_path), len(pages), stored_count, document_id):
-            delete_document_vectors(user["id"], document_id)
-            persistent_path.unlink(missing_ok=True)
-            raise HTTPException(status_code=409, detail="A document with this filename already exists in your workspace.")
+        if hosted:
+            from app.supabase_storage import upload_pdf as upload_to_supabase
+            storage_key = upload_to_supabase(user["id"], document_id, pdf_bytes)
+            storage_uploaded = True
 
+        if not database.create_document(
+            user["id"], raw_filename, stored_path, len(pages), len(chunks), document_id, storage_key=storage_key,
+        ):
+            raise HTTPException(status_code=409, detail="A document with this filename already exists in your workspace.")
+        document_created = True
+
+        stored_count = store_chunks(chunks)
         return {
             "document_id": document_id,
             "filename": raw_filename,
@@ -276,12 +277,27 @@ async def upload_pdf(file: UploadFile = File(...), user: dict = Depends(require_
             "chunks_stored": stored_count,
             "message": "PDF processed and stored successfully.",
         }
-
     except Exception:
-        # If indexing/metadata persistence failed, remove partial vectors and the PDF.
-        delete_document_vectors(user["id"], document_id)
-        persistent_path.unlink(missing_ok=True)
+        if document_created:
+            try:
+                delete_document_vectors(user["id"], document_id)
+            except Exception:
+                pass
+            try:
+                database.delete_document_record(user["id"], document_id)
+            except Exception:
+                pass
+        if storage_uploaded and storage_key:
+            try:
+                from app.supabase_storage import delete_pdf as delete_from_supabase
+                delete_from_supabase(storage_key)
+            except Exception:
+                pass
+        if persistent_path:
+            persistent_path.unlink(missing_ok=True)
         raise
+    finally:
+        await file.close()
 
 
 @app.post("/search")
@@ -518,7 +534,18 @@ def remove_document(filename: str, user: dict = Depends(require_csrf)):
 @app.get("/documents/{filename}/download")
 def download_document(filename: str, user: dict = Depends(require_session)):
     document = database.get_document(user["id"], filename)
-    if not document or not document.get("stored_path") or not Path(document["stored_path"]).is_file():
+    if not document:
+        raise HTTPException(status_code=404, detail="The original PDF is not available in your workspace.")
+    if document.get("storage_key"):
+        from urllib.parse import quote
+        from app.supabase_storage import SupabaseStorageError, download_pdf
+        try:
+            pdf_bytes = download_pdf(document["storage_key"])
+        except SupabaseStorageError:
+            raise HTTPException(status_code=502, detail="Document storage is temporarily unavailable.") from None
+        disposition = f"attachment; filename=\"document.pdf\"; filename*=UTF-8''{quote(document['filename'])}"
+        return RawResponse(content=pdf_bytes, media_type="application/pdf", headers={"Content-Disposition": disposition})
+    if not document.get("stored_path") or not Path(document["stored_path"]).is_file():
         raise HTTPException(status_code=404, detail="The original PDF is not available in your workspace.")
     return FileResponse(document["stored_path"], filename=document["filename"], media_type="application/pdf")
 

@@ -169,6 +169,129 @@ class AuthenticationAndIsolationTests(unittest.TestCase):
         self.assertIn("httponly", cookie)
         self.assertIn("secure", cookie)
         self.assertIn("samesite=strict", cookie)
+        with patch.dict(os.environ, {"APP_ENV": "production", "AUTH_COOKIE_SAMESITE": "none"}):
+            cross_site_response = self.client.get("/auth/csrf")
+        cross_site_cookie = cross_site_response.headers["set-cookie"].lower()
+        self.assertIn("secure", cross_site_cookie)
+        self.assertIn("samesite=none", cross_site_cookie)
+        with patch.dict(os.environ, {"APP_ENV": "development", "AUTH_COOKIE_SAMESITE": "none"}):
+            invalid_cookie_mode = self.client.get("/auth/csrf")
+        self.assertEqual(invalid_cookie_mode.status_code, 503)
+
+    def test_cors_allows_configured_frontend_with_credentials(self):
+        response = self.client.options("/documents", headers={
+            "Origin": ORIGIN,
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "x-csrf-token",
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["access-control-allow-origin"], ORIGIN)
+        self.assertEqual(response.headers["access-control-allow-credentials"], "true")
+
+    def test_supabase_storage_client_uses_private_authenticated_routes(self):
+        from app.supabase_storage import delete_pdf, download_pdf, upload_pdf
+
+        with patch.dict(os.environ, {
+            "SUPABASE_URL": "https://project.example.supabase.co",
+            "SUPABASE_SERVICE_ROLE_KEY": "test-only-storage-key",
+            "SUPABASE_STORAGE_BUCKET": "documents",
+            "APP_ENV": "production",
+        }), patch("app.supabase_storage.httpx.Client") as client_type:
+            client = client_type.return_value.__enter__.return_value
+            response = client.request.return_value
+            response.content = b"%PDF-test"
+            response.raise_for_status.return_value = None
+            key = upload_pdf("owner123", "document456", b"%PDF-test")
+            downloaded = download_pdf(key)
+            delete_pdf(key)
+
+        self.assertEqual(key, "owner123/document456.pdf")
+        self.assertEqual(downloaded, b"%PDF-test")
+        requests = client.request.call_args_list
+        self.assertEqual([call.args[0] for call in requests], ["POST", "GET", "DELETE"])
+        self.assertIn("/object/documents/owner123/document456.pdf", requests[0].args[1])
+        self.assertIn("/object/authenticated/documents/owner123/document456.pdf", requests[1].args[1])
+        self.assertEqual(requests[2].kwargs["json"], {"prefixes": [key]})
+        self.assertEqual(requests[0].kwargs["headers"]["Authorization"], "Bearer test-only-storage-key")
+
+    def test_pgvector_backend_search_and_delete_are_owner_scoped(self):
+        from app.vector_store import delete_document_vectors, get_document_chunks, search_chunks, store_chunks
+
+        owner_a = database.create_user("vector_user_a", self.password_hash)
+        owner_b = database.create_user("vector_user_b", self.password_hash)
+        doc_a, doc_b = "vector-doc-a", "vector-doc-b"
+        self.assertTrue(database.create_document(owner_a["id"], "shared.pdf", None, 1, 1, doc_a))
+        self.assertTrue(database.create_document(owner_b["id"], "shared.pdf", None, 1, 1, doc_b))
+        chunks = [
+            {"text": "A private passage", "metadata": {"owner_id": owner_a["id"], "document_id": doc_a, "source": "shared.pdf", "page_number": 1, "chunk_index": 0}},
+            {"text": "B private passage", "metadata": {"owner_id": owner_b["id"], "document_id": doc_b, "source": "shared.pdf", "page_number": 1, "chunk_index": 0}},
+        ]
+
+        def encode(texts, **_kwargs):
+            values = np.zeros((len(texts), 384), dtype=float)
+            for row, value in zip(values, texts):
+                row[0 if value.startswith("A") or value == "query" else 1] = 1.0
+            return values
+
+        with patch.dict(os.environ, {
+            "VECTOR_STORE_BACKEND": "pgvector",
+            "SUPABASE_URL": "https://project.example.supabase.co",
+            "SUPABASE_SERVICE_ROLE_KEY": "test-only-storage-key",
+        }), patch(
+            "app.vector_store.embedding_model.encode", side_effect=encode,
+        ):
+            self.assertEqual(store_chunks(chunks), 2)
+            result_a = search_chunks(owner_a["id"], "query", top_k=5, sources=["shared.pdf"])
+            result_b = search_chunks(owner_b["id"], "query", top_k=5, sources=["shared.pdf"])
+            read_a = get_document_chunks(["shared.pdf"], owner_a["id"])
+            deleted = delete_document_vectors(owner_a["id"], doc_a)
+            remaining_b = search_chunks(owner_b["id"], "query", top_k=5)
+
+        self.assertEqual([item["text"] for item in result_a], ["A private passage"])
+        self.assertEqual([item["text"] for item in result_b], ["B private passage"])
+        self.assertEqual(read_a[0]["metadata"]["owner_id"], owner_a["id"])
+        self.assertEqual(deleted, 1)
+        self.assertEqual([item["text"] for item in remaining_b], ["B private passage"])
+
+    def test_hosted_pdf_flow_uses_supabase_without_local_files(self):
+        user_a = TestClient(app)
+        user_b = TestClient(app)
+        self.assertEqual(self.register("hosted_user_a", client=user_a).status_code, 201)
+        self.assertEqual(self.register("hosted_user_b", client=user_b).status_code, 201)
+        owner_a = database.get_user_by_identifier("hosted_user_a")
+        body = b"%PDF-test-content"
+
+        def encode(texts, **_kwargs):
+            vectors = np.zeros((len(texts), 384), dtype=float)
+            vectors[:, 0] = 1.0
+            return vectors
+
+        with patch.dict(os.environ, {
+            "VECTOR_STORE_BACKEND": "pgvector",
+            "SUPABASE_URL": "https://project.example.supabase.co",
+            "SUPABASE_SERVICE_ROLE_KEY": "test-only-storage-key",
+        }), patch(
+            "app.main.extract_pdf_pages_from_bytes", return_value=[{"page_number": 1, "text": "Hosted PDF content."}],
+        ), patch("app.supabase_storage.upload_pdf", side_effect=lambda owner_id, document_id, _content: f"{owner_id}/{document_id}.pdf") as upload, patch(
+            "app.supabase_storage.download_pdf", return_value=body,
+        ) as download, patch("app.supabase_storage.delete_pdf") as remove, patch(
+            "app.vector_store.embedding_model.encode", side_effect=encode,
+        ):
+            uploaded = user_a.post("/upload-pdf", files={"file": ("hosted.pdf", body, "application/pdf")}, headers={"Origin": ORIGIN, "X-CSRF-Token": user_a.cookies.get("mini_notebooklm_csrf")})
+            self.assertEqual(uploaded.status_code, 200, uploaded.text)
+            record = database.get_document(owner_a["id"], "hosted.pdf")
+            self.assertIsNone(record["stored_path"])
+            self.assertEqual(record["storage_key"], f"{owner_a['id']}/{uploaded.json()['document_id']}.pdf")
+            self.assertTrue(user_a.get("/documents").json()["documents"][0]["download_available"])
+            self.assertEqual(user_a.get("/documents/hosted.pdf/download").content, body)
+            self.assertEqual(user_b.get("/documents/hosted.pdf/download").status_code, 404)
+            removed = user_a.delete("/documents/hosted.pdf", headers={"Origin": ORIGIN, "X-CSRF-Token": user_a.cookies.get("mini_notebooklm_csrf")})
+
+        self.assertEqual(removed.status_code, 200)
+        upload.assert_called_once()
+        download.assert_called_once_with(record["storage_key"])
+        remove.assert_called_once_with(record["storage_key"])
+        self.assertIsNone(database.get_document(owner_a["id"], "hosted.pdf"))
 
     def test_login_rate_limit_is_shared_through_database(self):
         self.register("rate_user")
@@ -341,7 +464,8 @@ class AuthenticationAndIsolationTests(unittest.TestCase):
             command.upgrade(config, "head")
         migration_engine = create_engine(target_url)
         names = set(inspect(migration_engine).get_table_names())
-        self.assertTrue(set(("users", "sessions", "login_attempts", "documents", "study_materials", "quizzes", "alembic_version")).issubset(names))
+        self.assertTrue(set(("users", "sessions", "login_attempts", "documents", "study_materials", "quizzes", "document_chunks", "alembic_version")).issubset(names))
+        self.assertIn("storage_key", {column["name"] for column in inspect(migration_engine).get_columns("documents")})
         migration_engine.dispose()
 
     def test_database_configuration_requires_explicit_postgres_in_production(self):

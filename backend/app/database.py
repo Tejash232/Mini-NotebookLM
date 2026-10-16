@@ -12,11 +12,13 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from sqlalchemy import (
-    Column, Float, ForeignKey, Index, Integer, MetaData, String, Table, Text,
-    UniqueConstraint, create_engine, delete, func, insert, inspect, select, update,
+    JSON, Column, Float, ForeignKey, ForeignKeyConstraint, Index, Integer,
+    MetaData, String, Table, Text, UniqueConstraint, create_engine, delete, func,
+    insert, inspect, select, update,
 )
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
+from pgvector.sqlalchemy import Vector
 
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
@@ -52,12 +54,33 @@ documents = Table(
     Column("owner_id", String(64), ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
     Column("filename", Text, nullable=False),
     Column("stored_path", Text),
+    Column("storage_key", Text),
     Column("pages", Integer, nullable=False),
     Column("chunks", Integer, nullable=False),
     Column("created_at", Float, nullable=False),
     UniqueConstraint("owner_id", "filename", name="documents_owner_filename_key"),
+    UniqueConstraint("owner_id", "id", name="documents_owner_id_key"),
 )
 Index("documents_owner_idx", documents.c.owner_id)
+document_chunks = Table(
+    "document_chunks", metadata,
+    Column("id", String(160), primary_key=True),
+    Column("owner_id", String(64), ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
+    Column("document_id", String(64), nullable=False),
+    Column("source", Text, nullable=False),
+    Column("page_number", Integer, nullable=False),
+    Column("chunk_index", Integer, nullable=False),
+    Column("content", Text, nullable=False),
+    Column("embedding", Vector(384).with_variant(JSON(), "sqlite"), nullable=False),
+    ForeignKeyConstraint(
+        ["owner_id", "document_id"], ["documents.owner_id", "documents.id"],
+        name="document_chunks_owner_document_fkey", ondelete="CASCADE",
+    ),
+    UniqueConstraint("owner_id", "document_id", "page_number", "chunk_index", name="document_chunks_position_key"),
+)
+Index("document_chunks_owner_document_idx", document_chunks.c.owner_id, document_chunks.c.document_id)
+Index("document_chunks_owner_source_idx", document_chunks.c.owner_id, document_chunks.c.source)
+Index("document_chunks_embedding_hnsw_idx", document_chunks.c.embedding, postgresql_using="hnsw", postgresql_ops={"embedding": "vector_cosine_ops"})
 study_materials = Table(
     "study_materials", metadata,
     Column("id", String(64), primary_key=True),
@@ -213,23 +236,23 @@ def clear_login_attempts(address_key: str) -> None:
         connection.execute(delete(login_attempts).where(login_attempts.c.address_key == address_key))
 
 
-def create_document(owner_id: str, filename: str, stored_path: str | None, pages: int, chunks: int, document_id: str) -> bool:
+def create_document(owner_id: str, filename: str, stored_path: str | None, pages: int, chunks: int, document_id: str, storage_key: str | None = None) -> bool:
     try:
         with engine().begin() as connection:
-            connection.execute(insert(documents).values(id=document_id, owner_id=owner_id, filename=filename, stored_path=stored_path, pages=pages, chunks=chunks, created_at=time.time()))
+            connection.execute(insert(documents).values(id=document_id, owner_id=owner_id, filename=filename, stored_path=stored_path, storage_key=storage_key, pages=pages, chunks=chunks, created_at=time.time()))
     except IntegrityError:
         return False
     return True
 
 
 def list_documents(owner_id: str) -> list[dict]:
-    query = select(documents.c.id.label("document_id"), documents.c.filename, documents.c.pages, documents.c.chunks, documents.c.stored_path, documents.c.created_at).where(documents.c.owner_id == owner_id).order_by(func.lower(documents.c.filename))
+    query = select(documents.c.id.label("document_id"), documents.c.filename, documents.c.pages, documents.c.chunks, documents.c.stored_path, documents.c.storage_key, documents.c.created_at).where(documents.c.owner_id == owner_id).order_by(func.lower(documents.c.filename))
     with engine().connect() as connection:
         return [dict(row) for row in connection.execute(query).mappings()]
 
 
 def get_document(owner_id: str, filename: str) -> dict | None:
-    query = select(documents.c.id.label("document_id"), documents.c.owner_id, documents.c.filename, documents.c.pages, documents.c.chunks, documents.c.stored_path, documents.c.created_at).where(documents.c.owner_id == owner_id, documents.c.filename == filename)
+    query = select(documents.c.id.label("document_id"), documents.c.owner_id, documents.c.filename, documents.c.pages, documents.c.chunks, documents.c.stored_path, documents.c.storage_key, documents.c.created_at).where(documents.c.owner_id == owner_id, documents.c.filename == filename)
     with engine().connect() as connection:
         return _dict(connection.execute(query).mappings().first())
 
