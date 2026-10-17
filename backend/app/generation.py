@@ -3,9 +3,7 @@ import os
 import json
 
 from groq import Groq
-from dotenv import load_dotenv
-
-load_dotenv()
+from app import config as _config  # Load backend/.env before reading os.environ.
 
 MODEL_NAME = os.getenv(
     "GROQ_MODEL",

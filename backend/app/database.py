@@ -11,6 +11,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from app import config as _config  # Load backend/.env before reading os.environ.
 from sqlalchemy import (
     JSON, Column, Float, ForeignKey, ForeignKeyConstraint, Index, Integer,
     MetaData, String, Table, Text, UniqueConstraint, create_engine, delete, func,
