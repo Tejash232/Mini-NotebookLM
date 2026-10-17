@@ -2,6 +2,8 @@
 import os
 import re
 import hmac
+import logging
+import time
 from contextlib import asynccontextmanager
 from typing import Literal
 from uuid import uuid4
@@ -200,6 +202,7 @@ class QuizSubmission(BaseModel):
 
 
 MAX_UPLOAD_BYTES = 30 * 1024 * 1024
+logger = logging.getLogger(__name__)
 
 
 @app.get("/")
@@ -214,6 +217,7 @@ def health():
 
 @app.post("/upload-pdf")
 async def upload_pdf(file: UploadFile = File(...), user: dict = Depends(require_csrf)):
+    upload_started = time.perf_counter()
     raw_filename = (file.filename or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
     if not raw_filename or not raw_filename.lower().endswith(".pdf"):
         raise HTTPException(
@@ -248,11 +252,13 @@ async def upload_pdf(file: UploadFile = File(...), user: dict = Depends(require_
             persistent_path.write_bytes(pdf_bytes)
             pages = extract_pdf_pages(str(persistent_path))
             stored_path = str(persistent_path)
+        logger.info("PDF upload stage=extract elapsed_seconds=%.3f pages=%d", time.perf_counter() - upload_started, len(pages))
 
         if not pages:
             raise HTTPException(status_code=422, detail="No extractable text found. The PDF may be scanned.")
 
         chunks = split_pages_into_chunks(pages=pages, filename=raw_filename)
+        logger.info("PDF upload stage=chunk elapsed_seconds=%.3f chunks=%d", time.perf_counter() - upload_started, len(chunks))
         for chunk in chunks:
             chunk["metadata"]["owner_id"] = user["id"]
             chunk["metadata"]["document_id"] = document_id
@@ -261,6 +267,10 @@ async def upload_pdf(file: UploadFile = File(...), user: dict = Depends(require_
             from app.supabase_storage import upload_pdf as upload_to_supabase
             storage_key = upload_to_supabase(user["id"], document_id, pdf_bytes)
             storage_uploaded = True
+            # Keep the 30 MB request body out of memory while the model embeds
+            # chunks. PDF parsing has completed and the private object is durable.
+            del pdf_bytes
+            logger.info("PDF upload stage=storage elapsed_seconds=%.3f", time.perf_counter() - upload_started)
 
         if not database.create_document(
             user["id"], raw_filename, stored_path, len(pages), len(chunks), document_id, storage_key=storage_key,
@@ -269,6 +279,8 @@ async def upload_pdf(file: UploadFile = File(...), user: dict = Depends(require_
         document_created = True
 
         stored_count = store_chunks(chunks)
+        logger.info("PDF upload stage=embed_and_persist elapsed_seconds=%.3f chunks=%d", time.perf_counter() - upload_started, stored_count)
+        logger.info("PDF upload stage=complete elapsed_seconds=%.3f", time.perf_counter() - upload_started)
         return {
             "document_id": document_id,
             "filename": raw_filename,

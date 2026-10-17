@@ -272,13 +272,15 @@ class AuthenticationAndIsolationTests(unittest.TestCase):
             "SUPABASE_SERVICE_ROLE_KEY": "test-only-storage-key",
         }), patch(
             "app.main.extract_pdf_pages_from_bytes", return_value=[{"page_number": 1, "text": "Hosted PDF content."}],
-        ), patch("app.supabase_storage.upload_pdf", side_effect=lambda owner_id, document_id, _content: f"{owner_id}/{document_id}.pdf") as upload, patch(
+        ) as extract, patch("app.supabase_storage.upload_pdf", side_effect=lambda owner_id, document_id, _content: f"{owner_id}/{document_id}.pdf") as upload, patch(
             "app.supabase_storage.download_pdf", return_value=body,
         ) as download, patch("app.supabase_storage.delete_pdf") as remove, patch(
             "app.vector_store.embedding_model.encode", side_effect=encode,
-        ):
+        ) as encode_mock:
             uploaded = user_a.post("/upload-pdf", files={"file": ("hosted.pdf", body, "application/pdf")}, headers={"Origin": ORIGIN, "X-CSRF-Token": user_a.cookies.get("mini_notebooklm_csrf")})
             self.assertEqual(uploaded.status_code, 200, uploaded.text)
+            retried = user_a.post("/upload-pdf", files={"file": ("hosted.pdf", body, "application/pdf")}, headers={"Origin": ORIGIN, "X-CSRF-Token": user_a.cookies.get("mini_notebooklm_csrf")})
+            self.assertEqual(retried.status_code, 409)
             record = database.get_document(owner_a["id"], "hosted.pdf")
             self.assertIsNone(record["stored_path"])
             self.assertEqual(record["storage_key"], f"{owner_a['id']}/{uploaded.json()['document_id']}.pdf")
@@ -289,6 +291,10 @@ class AuthenticationAndIsolationTests(unittest.TestCase):
 
         self.assertEqual(removed.status_code, 200)
         upload.assert_called_once()
+        # A browser retry after a completed upload must not redo extraction or embeddings.
+        # The duplicate check runs before these expensive operations.
+        extract.assert_called_once()
+        encode_mock.assert_called_once()
         download.assert_called_once_with(record["storage_key"])
         remove.assert_called_once_with(record["storage_key"])
         self.assertIsNone(database.get_document(owner_a["id"], "hosted.pdf"))
